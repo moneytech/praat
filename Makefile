@@ -18,7 +18,7 @@ LD 	= $(CROSS)gcc
 	$(CC) $(CFLAGS) -c $<
 
 $(BIN):	$(OBJS)
-	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+	$(LD) -o $@ $(OBJS) $(LDFLAGS) 
 
 clean:	
 	rm -f $(OBJS) $(BIN) core
