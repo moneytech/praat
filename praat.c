@@ -9,6 +9,15 @@
 #include <stdint.h>
 #include <alsa/asoundlib.h>
 
+#define FRAME_HEADER_SIZE (3*2)
+
+struct frame {
+	uint16_t type;
+	uint16_t seq;
+	uint16_t datalen;
+	char data[4096];
+} __attribute__((__packed__));
+
 
 snd_pcm_t *alsa_open(const char *devname, unsigned samplerate, snd_pcm_uframes_t fragsize, unsigned nfrags, int direction);
 
@@ -21,19 +30,20 @@ int main(int argc, char **argv)
 	SpeexBits dec_bits; 
 	void *enc_state;
 	void *dec_state;
-	int frame_size;
+	int fragsize;
 	int r;
 	struct pollfd *pfds;
+	uint16_t seq = 0;
 
 	speex_bits_init(&enc_bits);
 	speex_bits_init(&dec_bits);
 	enc_state = speex_encoder_init(&speex_wb_mode); 
 	dec_state = speex_decoder_init(&speex_wb_mode); 
 
-	speex_encoder_ctl(enc_state,SPEEX_GET_FRAME_SIZE,&frame_size); 
+	speex_encoder_ctl(enc_state, SPEEX_GET_FRAME_SIZE, &fragsize); 
 
-	pcm_rec = alsa_open("default", 22050, frame_size, 8, SND_PCM_STREAM_CAPTURE);
-	pcm_play = alsa_open("default", 22050, frame_size, 8, SND_PCM_STREAM_PLAYBACK);
+	pcm_rec = alsa_open("default", 16000, fragsize, 8, SND_PCM_STREAM_CAPTURE);
+	pcm_play = alsa_open("default", 16000, fragsize, 8, SND_PCM_STREAM_PLAYBACK);
 
 	struct sockaddr_in sa;
 	memset(&sa, 0, sizeof sa);
@@ -43,9 +53,12 @@ int main(int argc, char **argv)
 	
 	int sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
 		
-	int nfds = snd_pcm_poll_descriptors_count(pcm_rec);
+	int nfds = snd_pcm_poll_descriptors_count(pcm_rec) + 1;
 	pfds = calloc(nfds, sizeof *pfds);
-	snd_pcm_poll_descriptors(pcm_rec,  pfds, nfds);
+	snd_pcm_poll_descriptors(pcm_rec,  pfds, nfds-1);
+
+	pfds[nfds-1].fd = sock;
+	pfds[nfds-1].events = POLLIN;
 	
 	for(;;) {
 
@@ -53,21 +66,46 @@ int main(int argc, char **argv)
 		snd_pcm_prepare(pcm_play); 
 		snd_pcm_reset(pcm_rec); 
 		snd_pcm_reset(pcm_play); 
-		snd_pcm_start(pcm_play);
 		snd_pcm_start(pcm_rec);
 
 		int xrun = 0;
+		int rx = 0;
+		int tx = 0;
+		uint16_t recbuf[fragsize];
+		int recptr = 0;
 
 		while(!xrun) {
 			
 			unsigned short revents;
-			char data[32768];
-			int16_t audio[frame_size];
+			int16_t audio[fragsize];
+			struct frame frame;
 
 			r = poll(pfds, nfds, -1);
 
+			/*
+			 * Read socket data 
+			 */
 
-			snd_pcm_poll_descriptors_revents(pcm_rec, pfds, nfds, &revents);
+			if(pfds[nfds-1].revents & POLLIN) {
+
+				rx++;
+
+				int r = recv(sock, &frame, sizeof frame, 0);
+				if(r == -1) {
+					fprintf(stderr, "recv(): %s\n", strerror(errno));
+					exit(1);
+				}
+				speex_bits_read_from(&dec_bits, frame.data, frame.datalen);
+				r = speex_decode_int(dec_state, &dec_bits, audio); 
+				
+				r = snd_pcm_writei(pcm_play, audio, fragsize);
+			}
+
+			/*
+			 * Read audio data
+			 */
+
+			snd_pcm_poll_descriptors_revents(pcm_rec, pfds, nfds-1, &revents);
 
 			if(revents & POLLERR) {
 				xrun = 1;
@@ -75,42 +113,34 @@ int main(int argc, char **argv)
 
 			if(revents & POLLIN) {
 
-				/*
-				 * Read audio data
-				 */
+				r = snd_pcm_readi(pcm_rec, recbuf + recptr, fragsize - recptr);
+				recptr += r;
 
-				r = snd_pcm_readi(pcm_rec, audio, frame_size);
+				if(recptr == fragsize) {
 
-				speex_bits_reset(&enc_bits);
-				speex_encode_int(enc_state, audio, &enc_bits);
-				r = speex_bits_write(&enc_bits, data, sizeof(data));
+					speex_bits_reset(&enc_bits);
+					speex_encode_int(enc_state, (void *)recbuf, &enc_bits);
+					r = speex_bits_write(&enc_bits, frame.data, sizeof(frame.data));
 
-				if(r > 0) {
-					r = sendto(sock, data, r, 0, (struct sockaddr *)&sa, sizeof sa);
-					if(r == -1) {
-						fprintf(stderr, "send(): %s\n", strerror(errno));
-						exit(1);
+					if(r > 0) {
+						frame.seq = seq++;
+						frame.datalen = r;
+						r = sendto(sock, &frame, frame.datalen + FRAME_HEADER_SIZE, 0, (struct sockaddr *)&sa, sizeof sa);
+						if(r == -1) {
+							fprintf(stderr, "send(): %s\n", strerror(errno));
+							exit(1);
+						}
+						tx++;
 					}
-				}
-
-				/*
-				 * Read socket data
-				 */
-
-				int r = recv(sock, data, sizeof data, 0);
-				if(r > 0) {
-					speex_bits_read_from(&dec_bits, data, r);
-					r = speex_decode_int(dec_state, &dec_bits, audio); 
 					
-					r = snd_pcm_writei(pcm_play, audio, frame_size);
-				} else {
-					if(errno != EAGAIN) {
-						fprintf(stderr, "recv(): %s\n", strerror(errno));
-						exit(1);
-					}
+					recptr = 0;
 				}
+
 			}
+
 		}
+
+		printf("xrun\n");
 	}
 
 	return 0;
@@ -149,8 +179,6 @@ snd_pcm_t *alsa_open(const char *devname, unsigned samplerate, snd_pcm_uframes_t
 	TRY(snd_pcm_hw_params_set_periods_near, pcm, hwparams, &nfrags, 0);
         TRY(snd_pcm_hw_params, pcm, hwparams);
 
-	printf("%d hz\n", samplerate);
-
 	/* Software params */
 	
 	snd_pcm_sw_params_alloca(&swparams);
@@ -165,6 +193,8 @@ snd_pcm_t *alsa_open(const char *devname, unsigned samplerate, snd_pcm_uframes_t
 	snd_output_buffer_string(out, &s);
 	//printf("%s\n", s);
 	snd_output_close(out);
+
+	printf("%d Hz, %d\n", samplerate, (int)fragsize);
 
 	return pcm;
 }
